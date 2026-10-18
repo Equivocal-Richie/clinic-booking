@@ -54,7 +54,7 @@ reads** — see [Authentication & roles](#authentication--roles) and
 | **Models** (`app/models/`) | SQLModel tables + the partial unique index that guarantees slot exclusivity. |
 | **Auth** (`app/security.py`, `app/api/deps.py`, `app/api/auth.py`) | JWT issuing/verification, bcrypt password hashing, and role guards (patient vs. staff). |
 | **Cross-cutting** (`app/ratelimit.py`, `app/errors.py`) | Rate limiting and a single consistent error envelope for every failure. |
-| **Migrations** (`alembic/`) | Versioned schema (two revisions): core tables + partial unique index, then users + idempotency keys. |
+| **Migrations** (`alembic/`) | Versioned schema (three revisions): core tables + partial unique index; then users + idempotency keys; then refresh tokens. |
 | **Config** (`app/config.py`) | 12-factor settings from env vars (DB URL, timezone, slot length, lead time, JWT secret, rate limits, page sizes). |
 
 ### Data model
@@ -66,6 +66,7 @@ erDiagram
     PATIENT ||--o{ APPOINTMENT : books
     PATIENT ||--o| USER : "logs in as"
     USER ||--o{ IDEMPOTENCY_KEY : owns
+    USER ||--o{ REFRESH_TOKEN : "holds"
 
     USER {
       int id PK
@@ -83,6 +84,13 @@ erDiagram
       string status "processing|completed"
       int response_status
       string response_body
+    }
+    REFRESH_TOKEN {
+      int id PK
+      int user_id FK
+      string token_hash "sha256"
+      datetime expires_at
+      bool revoked
     }
     DOCTOR {
       int id PK
@@ -185,8 +193,14 @@ released if the first attempt failed, so a corrected retry can reuse it.
 ## Authentication & roles
 
 Every data endpoint requires a **JWT bearer token** (`Authorization: Bearer
-<token>`). Passwords are hashed with **bcrypt**; tokens are signed HS256 with
-`SECRET_KEY`.
+<token>`). Passwords are hashed with **bcrypt**; access tokens are signed HS256
+with `SECRET_KEY` and are **short-lived (30 min)**.
+
+**Refresh tokens** are long-lived (14 days), opaque, and **DB-backed** — only a
+SHA-256 hash is stored, so a database leak exposes no usable token. They are
+**rotated on every refresh** (the old one is revoked) and **revocable** via
+logout. Presenting an already-rotated token is treated as reuse and revokes all
+of that user's tokens defensively. `GET /auth/me` returns the current user.
 
 Two roles:
 
@@ -235,9 +249,22 @@ share one shape:
 ```
 Creates a linked Patient + patient User. `409` if the email is taken.
 
-### `POST /auth/login` — obtain a token
+### `POST /auth/login` — obtain tokens
 Form-encoded (OAuth2 password flow): `username=<email>&password=<password>` →
-`{ "access_token": "...", "token_type": "bearer" }`. `401` on bad credentials.
+`{ "access_token": "...", "refresh_token": "...", "token_type": "bearer" }`.
+`401` on bad credentials.
+
+### `POST /auth/refresh` — rotate tokens
+`{ "refresh_token": "..." }` → a new `{ access_token, refresh_token }`. The old
+refresh token is revoked (rotation). `401` if the token is invalid, expired, or
+already used.
+
+### `POST /auth/logout` — revoke a refresh token
+`{ "refresh_token": "..." }` → `204`. Idempotent (revoking an unknown/already
+-revoked token still returns `204`).
+
+### `GET /auth/me` — current user
+Returns `{ id, email, role, patient_id }` for the bearer token. `401` if missing/invalid.
 
 ### `POST /auth/staff` — create a staff account _(staff only)_
 `{ "email": "...", "password": "..." }` → `201`. `403` for non-staff.
@@ -338,7 +365,7 @@ export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/clinic
 pytest --cov=app --cov-report=term-missing
 ```
 
-**53 tests, ~97% coverage.** Layers:
+**60 tests, ~97% coverage.** Layers:
 
 - **Unit** (`tests/unit/`) — the pure slot grid and timezone logic: boundaries,
   lunch gaps, off days, last-slot-must-fit, lead-time filtering. No DB, fast.
@@ -351,6 +378,9 @@ pytest --cov=app --cov-report=term-missing
   row. This is the proof that the slot guarantee holds under load.
 - **Auth & RBAC** (`test_auth_rbac.py`) — register/login, 401 without a token,
   and patients blocked (403) from acting on other patients or staff routes.
+- **Tokens** (`test_auth_tokens.py`) — `/auth/me`; refresh issues a working
+  access token and rotates the refresh token; a reused/rotated token is rejected
+  (401); logout revokes.
 - **Idempotency** (`test_idempotency.py`) — same key replays the original 201,
   different body is rejected, a failed attempt releases the key.
 - **Pagination** (`test_pagination.py`) and **rate limiting**
@@ -422,7 +452,6 @@ Auth/RBAC, idempotent booking, rate limiting, and pagination are **implemented**
 
 - **Redis-backed rate limiting** for a true cross-worker/instance global limit
   (in-memory today), plus request logging/observability.
-- **Refresh tokens / token revocation** (access tokens are short-lived only).
 - **Idempotency-key TTL / sweeper** so an interrupted request can't hold a key
   in `processing` forever.
 - **Keyset (cursor) pagination** for very large lists (offset degrades deep in).

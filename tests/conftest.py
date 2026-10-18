@@ -38,7 +38,7 @@ from app.models import Doctor, Patient, User, UserRole, WorkingHours  # noqa: E4
 from app.security import create_access_token, hash_password  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_TABLES = ["idempotency_keys", "appointments", "working_hours", "users", "patients", "doctors"]
+_TABLES = ["idempotency_keys", "refresh_tokens", "appointments", "working_hours", "users", "patients", "doctors"]
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -29,7 +29,9 @@ class Settings(BaseSettings):
     # MUST be overridden in production via the SECRET_KEY env var.
     secret_key: str = "dev-insecure-change-me"
     jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 60 * 12  # 12 hours
+    # Short-lived access token; long-lived refresh token (DB-backed, revocable).
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 14
 
     # --- Rate limiting ---
     # Default global limit per client, plus a tighter limit on booking writes.

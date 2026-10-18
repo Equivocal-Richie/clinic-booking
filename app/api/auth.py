@@ -6,10 +6,17 @@ from sqlmodel import Session, select
 
 from ..db import get_session
 from ..models import Patient, User, UserRole
-from ..schemas.auth import PatientRegister, StaffCreate, Token, UserRead
+from ..schemas.auth import (
+    PatientRegister,
+    RefreshRequest,
+    StaffCreate,
+    Token,
+    UserRead,
+)
 from ..schemas.error import ErrorResponse
-from ..security import create_access_token, hash_password, verify_password
-from .deps import require_staff
+from ..security import hash_password, verify_password
+from ..services import tokens
+from .deps import get_current_user, require_staff
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -58,8 +65,51 @@ def login(
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    token = create_access_token(user.id, user.role.value)
-    return Token(access_token=token)
+    access, refresh = tokens.issue_tokens(session, user)
+    return Token(access_token=access, refresh_token=refresh)
+
+
+@router.post(
+    "/refresh",
+    response_model=Token,
+    responses={401: {"model": ErrorResponse}},
+    summary="Exchange a refresh token for a new access token (rotates the refresh token)",
+)
+def refresh(payload: RefreshRequest, session: Session = Depends(get_session)) -> Token:
+    try:
+        access, new_refresh, _user = tokens.rotate(session, payload.refresh_token)
+    except tokens.RefreshError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return Token(access_token=access, refresh_token=new_refresh)
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a refresh token",
+)
+def logout(payload: RefreshRequest, session: Session = Depends(get_session)) -> None:
+    # Idempotent: revoking an unknown/already-revoked token still succeeds (204).
+    tokens.revoke(session, payload.refresh_token)
+
+
+@router.get(
+    "/me",
+    response_model=UserRead,
+    responses={401: {"model": ErrorResponse}},
+    summary="Current authenticated user",
+)
+def me(current: User = Depends(get_current_user)) -> UserRead:
+    return UserRead(
+        id=current.id,
+        email=current.email,
+        role=current.role,
+        patient_id=current.patient_id,
+    )
 
 
 @router.post(
