@@ -1,0 +1,31 @@
+# Render Blueprint (infrastructure as code).
+# Creates a Dockerized web service + a managed Postgres database.
+# autoDeploy is OFF on purpose: deploys are triggered by the GitHub Actions
+# pipeline only AFTER the test suite passes on a merge to main (see
+# .github/workflows/ci.yml). This keeps test -> gate -> deploy in one place.
+databases:
+  - name: clinic-db
+    plan: free
+    databaseName: clinic
+    user: clinic
+
+services:
+  - type: web
+    name: clinic-booking-api
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: clinic-db
+          property: connectionString
+      - key: CLINIC_TIMEZONE
+        value: Africa/Nairobi
+      - key: MIN_LEAD_MINUTES
+        value: "60"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: SEED_ON_START
+        value: "true"

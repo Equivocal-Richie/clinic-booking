@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Env / secrets
+.env
+*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local Postgres data (if run outside docker)
+pgdata/
