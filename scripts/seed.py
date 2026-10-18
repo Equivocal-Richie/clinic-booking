@@ -10,7 +10,8 @@ from datetime import time
 from sqlmodel import Session, select
 
 from app.db import engine
-from app.models import Doctor, Patient, WorkingHours
+from app.models import Doctor, Patient, User, UserRole, WorkingHours
+from app.security import hash_password
 
 # Weekdays Monday(0)..Friday(4). Each doctor works 09:00-13:00 and 14:00-17:00
 # (a lunch break modelled as two blocks). Doctor 5 also works Saturday mornings
@@ -60,9 +61,32 @@ def seed() -> None:
                     )
                 )
 
-        session.add(Patient(name="Sample Patient", email="patient@example.com"))
+        # A sample patient with a login, and a clinical-staff login, so the
+        # deployed API can be tried immediately. Change these in any real use.
+        patient = Patient(name="Sample Patient", email="patient@example.com")
+        session.add(patient)
+        session.flush()
+        session.add(
+            User(
+                email="patient@example.com",
+                hashed_password=hash_password("patientpass123"),
+                role=UserRole.patient,
+                patient_id=patient.id,
+            )
+        )
+        session.add(
+            User(
+                email="staff@clinic.test",
+                hashed_password=hash_password("staffpass123"),
+                role=UserRole.staff,
+            )
+        )
         session.commit()
-        print(f"Seeded {len(DOCTORS)} doctors with working hours and 1 sample patient.")
+        print(
+            f"Seeded {len(DOCTORS)} doctors with working hours, "
+            "1 patient login (patient@example.com / patientpass123), "
+            "and 1 staff login (staff@clinic.test / staffpass123)."
+        )
 
 
 if __name__ == "__main__":

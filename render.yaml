@@ -29,3 +29,9 @@ services:
         value: "2"
       - key: SEED_ON_START
         value: "true"
+      # JWT signing secret — generated once by Render and kept stable.
+      - key: SECRET_KEY
+        generateValue: true
+      # Optional: set to a Redis URL for cross-worker rate limiting.
+      # - key: RATE_LIMIT_STORAGE_URI
+      #   value: redis://...

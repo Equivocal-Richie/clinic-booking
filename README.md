@@ -7,6 +7,11 @@ is never double-booked, even under concurrent requests.
 Built with **FastAPI + SQLModel + PostgreSQL**, deployed on **Render** with a
 **GitHub Actions** pipeline that tests every PR and deploys on merge.
 
+Hardened with **JWT auth and patient/staff role-based access control**,
+**idempotent booking** (Idempotency-Key), **rate limiting**, and **paginated
+reads** — see [Authentication & roles](#authentication--roles) and
+[Hardening features](#hardening-features).
+
 - **Live API:** `https://<your-service>.onrender.com`  _(replace after first deploy)_
 - **Interactive docs (Swagger):** `https://<your-service>.onrender.com/docs`
 - **Health check:** `https://<your-service>.onrender.com/health`
@@ -19,13 +24,15 @@ Built with **FastAPI + SQLModel + PostgreSQL**, deployed on **Render** with a
 ## Table of contents
 
 1. [Section 1 — System design](#section-1--system-design)
-2. [API reference](#api-reference)
-3. [Running locally](#running-locally)
-4. [Testing](#testing)
-5. [Section 3 — Deployment & CI/CD](#section-3--deployment--cicd)
-6. [Ambiguities & decisions](#ambiguities--decisions)
-7. [Limitations & next steps](#limitations--next-steps)
-8. [Section 4 — AI reflection](#section-4--ai-reflection)
+2. [Authentication & roles](#authentication--roles)
+3. [Hardening features](#hardening-features)
+4. [API reference](#api-reference)
+5. [Running locally](#running-locally)
+6. [Testing](#testing)
+7. [Section 3 — Deployment & CI/CD](#section-3--deployment--cicd)
+8. [Ambiguities & decisions](#ambiguities--decisions)
+9. [Limitations & next steps](#limitations--next-steps)
+10. [Section 4 — AI reflection](#section-4--ai-reflection)
 
 ---
 
@@ -45,8 +52,10 @@ Built with **FastAPI + SQLModel + PostgreSQL**, deployed on **Render** with a
 | **API layer** (`app/api/`) | HTTP routing, request/response schemas, status codes. Thin — no business logic. |
 | **Service layer** (`app/services/`) | All booking rules. `slots.py` is **pure** (no DB/HTTP) so the core logic is trivially testable; `availability.py` / `booking.py` wrap it with persistence. |
 | **Models** (`app/models/`) | SQLModel tables + the partial unique index that guarantees slot exclusivity. |
-| **Migrations** (`alembic/`) | Versioned schema, including the partial unique index. |
-| **Config** (`app/config.py`) | 12-factor settings from env vars (DB URL, timezone, slot length, lead time). |
+| **Auth** (`app/security.py`, `app/api/deps.py`, `app/api/auth.py`) | JWT issuing/verification, bcrypt password hashing, and role guards (patient vs. staff). |
+| **Cross-cutting** (`app/ratelimit.py`, `app/errors.py`) | Rate limiting and a single consistent error envelope for every failure. |
+| **Migrations** (`alembic/`) | Versioned schema (two revisions): core tables + partial unique index, then users + idempotency keys. |
+| **Config** (`app/config.py`) | 12-factor settings from env vars (DB URL, timezone, slot length, lead time, JWT secret, rate limits, page sizes). |
 
 ### Data model
 
@@ -55,7 +64,26 @@ erDiagram
     DOCTOR ||--o{ WORKING_HOURS : has
     DOCTOR ||--o{ APPOINTMENT : receives
     PATIENT ||--o{ APPOINTMENT : books
+    PATIENT ||--o| USER : "logs in as"
+    USER ||--o{ IDEMPOTENCY_KEY : owns
 
+    USER {
+      int id PK
+      string email UK
+      string hashed_password
+      enum role "patient|staff"
+      int patient_id FK "null for staff"
+      bool is_active
+    }
+    IDEMPOTENCY_KEY {
+      int id PK
+      int user_id FK
+      string idem_key
+      string request_fingerprint
+      string status "processing|completed"
+      int response_status
+      string response_body
+    }
     DOCTOR {
       int id PK
       string name
@@ -141,23 +169,88 @@ An incoming `start_time` with an offset is respected; a naive one is interpreted
 as clinic-local. This keeps storage unambiguous while matching how staff think
 ("book 2pm").
 
+### Key decision 4 — Idempotent booking writes
+
+POST is not idempotent by default, so a network retry or a double-click can send
+the same booking twice. Clients may send an `Idempotency-Key` header; the first
+request does the work and stores its response (scoped to the user), and any
+replay with the same key returns that stored response instead of acting again.
+The `(user_id, idem_key)` unique constraint is the race arbiter — identical to
+the slot-exclusivity pattern — so even two simultaneous retries resolve to one
+booking. A key reused with a *different* body is rejected (422); a key is
+released if the first attempt failed, so a corrected retry can reuse it.
+
+---
+
+## Authentication & roles
+
+Every data endpoint requires a **JWT bearer token** (`Authorization: Bearer
+<token>`). Passwords are hashed with **bcrypt**; tokens are signed HS256 with
+`SECRET_KEY`.
+
+Two roles:
+
+- **patient** — linked to a Patient record; may book, cancel, reschedule and list
+  **only their own** appointments.
+- **staff** (clinical/reception) — may act across **all** patients and provision
+  other staff accounts.
+
+Flow: `POST /auth/register` (self-service patient signup) → `POST /auth/login`
+(returns a token) → send the token on every other call. Staff accounts are
+seeded or created by existing staff via `POST /auth/staff`.
+
+**Demo credentials** (created by `scripts/seed.py`): patient
+`patient@example.com` / `patientpass123`, staff `staff@clinic.test` /
+`staffpass123`.
+
+## Hardening features
+
+| Feature | How | Why |
+|---|---|---|
+| **RBAC** | `get_current_user` + role guards on every route; patients forced to their own `patient_id` | Clinical data must be access-controlled |
+| **Idempotent booking** | `Idempotency-Key` header + `(user_id, key)` unique row | Safe client retries without duplicate bookings |
+| **Rate limiting** | slowapi: global `120/min` + `15/min` on booking, keyed by client IP (X-Forwarded-For aware) | Protect the service from spam/abuse |
+| **Pagination** | `limit`/`offset` with `has_more` (fetch limit+1, no COUNT) on list reads | Fast reads as data grows |
+| **Consistent errors** | one `{"error":{code,message}}` envelope for domain, auth, and validation failures | Predictable client handling |
+
+> Rate-limit note: the default limiter store is in-memory, i.e. **per worker**.
+> For a hard global limit across workers/instances, set `RATE_LIMIT_STORAGE_URI`
+> to a Redis URL — the same "shared guarantees need shared state" lesson as slot
+> locking.
+
 ---
 
 ## API reference
 
-All error responses share one shape:
+All data endpoints require `Authorization: Bearer <token>`. All error responses
+share one shape:
 
 ```json
 { "error": { "code": "slot_taken", "message": "That slot has just been booked by someone else" } }
 ```
 
+### `POST /auth/register` — patient self-signup
+```json
+{ "email": "jane@example.com", "password": "secretpw1", "name": "Jane", "phone": "+254..." }
+```
+Creates a linked Patient + patient User. `409` if the email is taken.
+
+### `POST /auth/login` — obtain a token
+Form-encoded (OAuth2 password flow): `username=<email>&password=<password>` →
+`{ "access_token": "...", "token_type": "bearer" }`. `401` on bad credentials.
+
+### `POST /auth/staff` — create a staff account _(staff only)_
+`{ "email": "...", "password": "..." }` → `201`. `403` for non-staff.
+
 ### `POST /appointments` — book a slot
 ```json
 { "doctor_id": 1, "patient_id": 1, "start_time": "2026-10-26T09:00:00+03:00" }
 ```
-`201` on success. Validates: doctor & patient exist, start is a real 30-min slot
-inside the doctor's working hours on a working day, not in the past, and (bonus)
-at least 60 minutes ahead.
+Optional header `Idempotency-Key: <stable-id>` makes retries safe (see Key
+decision 4). `201` on success. A **patient** may only book for their own
+`patient_id` (else `403`); **staff** may book for any patient. Validates: doctor &
+patient exist, start is a real 30-min slot inside the doctor's working hours on a
+working day, not in the past, and (bonus) at least 60 minutes ahead.
 
 ### `GET /doctors/{id}/availability?date=YYYY-MM-DD`
 Returns the available 30-minute slots for that doctor on that date (clinic tz):
@@ -182,19 +275,26 @@ cancelled, `404` if not found, `422` if reason is empty.
 Moves to a new slot, validated as a fresh booking; original frees atomically.
 `409` if the appointment is cancelled or the target slot is taken.
 
-### `GET /patients/{id}/appointments` _(bonus)_
+### `GET /patients/{id}/appointments?limit=20&offset=0` _(bonus)_
 Upcoming **booked** appointments, soonest first (cancelled/past excluded).
+Patients may read only their own list; staff may read any. Paginated:
+```json
+{ "items": [ ... ], "limit": 20, "offset": 0, "has_more": false }
+```
 
 ### Status-code strategy
 
 | Code | When |
 |---|---|
-| `201` | Appointment created |
-| `200` | Cancel / reschedule / reads |
-| `422` | Request **shape** invalid (missing field, empty reason, bad date) — Pydantic |
+| `201` | Appointment / account created |
+| `200` | Cancel / reschedule / login / reads |
+| `422` | Request **shape** invalid (missing field, empty reason, bad date, bad limit) — Pydantic |
 | `400` | Request well-formed but breaks a **business rule** (past, outside hours, lead time) |
+| `401` | Missing or invalid token |
+| `403` | Authenticated but not allowed (patient acting on another's data; non-staff hitting a staff route) |
 | `404` | Doctor / patient / appointment not found |
 | `409` | Slot already taken, or illegal state transition (cancel an already-cancelled, reschedule a cancelled) |
+| `429` | Rate limit exceeded |
 
 ### Edge cases handled
 
@@ -204,7 +304,9 @@ not an error); the last slot of a block requiring the full 30 minutes to fit
 (a block ending 17:00 yields a last slot at 16:30); double-cancel; reschedule of
 a cancelled appointment; reschedule into an occupied slot (original preserved);
 unknown doctor/patient/appointment; malformed date; timezone conversion between
-clinic-local input and UTC storage; and the concurrent double-booking race.
+clinic-local input and UTC storage; the concurrent double-booking race; a
+retried/duplicate POST collapsing to one booking via Idempotency-Key; and a
+patient attempting to read or modify another patient's appointments (403).
 
 ---
 
@@ -236,7 +338,7 @@ export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/clinic
 pytest --cov=app --cov-report=term-missing
 ```
 
-**35 tests, ~99% coverage.** Three layers:
+**53 tests, ~97% coverage.** Layers:
 
 - **Unit** (`tests/unit/`) — the pure slot grid and timezone logic: boundaries,
   lunch gaps, off days, last-slot-must-fit, lead-time filtering. No DB, fast.
@@ -247,6 +349,12 @@ pytest --cov=app --cov-report=term-missing
   concurrent booking attempts at the same slot (each on its own connection) and
   asserts **exactly one succeeds** and the database ends with exactly one active
   row. This is the proof that the slot guarantee holds under load.
+- **Auth & RBAC** (`test_auth_rbac.py`) — register/login, 401 without a token,
+  and patients blocked (403) from acting on other patients or staff routes.
+- **Idempotency** (`test_idempotency.py`) — same key replays the original 201,
+  different body is rejected, a failed attempt releases the key.
+- **Pagination** (`test_pagination.py`) and **rate limiting**
+  (`test_rate_limit.py`, self-contained with limits on).
 
 The test suite builds its schema by running the **Alembic migrations**, so every
 run also verifies migrations apply cleanly and create the partial unique index.
@@ -289,9 +397,10 @@ self-migrating.
 
 The brief invited judgement calls; here are the notable ones.
 
-- **No authentication.** The brief doesn't mention it; I left it out deliberately
-  rather than ship a half-built auth layer, and flagged it under next steps. In
-  production this API must be authenticated.
+- **Authentication & RBAC are implemented** (JWT, patient/staff roles). The brief
+  didn't require them; they were added deliberately to make the API production-shaped.
+  Decision: patients self-register and are auto-linked to a Patient record; staff
+  accounts are provisioned (seeded or by existing staff), not self-service.
 - **Patients aren't blocked from overlapping across doctors.** The requirement is
   per-doctor slot exclusivity. A patient booking two different doctors at the same
   time is a real-world conflict but out of the stated scope — noted, not enforced.
@@ -308,13 +417,19 @@ The brief invited judgement calls; here are the notable ones.
 
 ## Limitations & next steps
 
-- **Auth & roles** (patient vs. clinic staff) — the clearest gap.
-- **Idempotency keys** on `POST /appointments` to make client retries safe.
-- **Pagination** on patient appointment lists as data grows.
-- **Rate limiting** and request logging/observability.
+Auth/RBAC, idempotent booking, rate limiting, and pagination are **implemented**
+(see [Hardening features](#hardening-features)). Remaining:
+
+- **Redis-backed rate limiting** for a true cross-worker/instance global limit
+  (in-memory today), plus request logging/observability.
+- **Refresh tokens / token revocation** (access tokens are short-lived only).
+- **Idempotency-key TTL / sweeper** so an interrupted request can't hold a key
+  in `processing` forever.
+- **Keyset (cursor) pagination** for very large lists (offset degrades deep in).
 - **Doctor time-off / holidays** as a first-class concept (today, only recurring
   weekly hours exist).
 - **Notifications** (email/SMS reminders) — a natural clinic feature.
+- **Patient-level overlap prevention** across doctors (currently per-doctor only).
 
 ---
 
@@ -327,10 +442,11 @@ The brief invited judgement calls; here are the notable ones.
 **1. What AI was used for across the four sections.** Scaffolding the project
 layout; drafting the SQLModel models, the pure/impure service split, and the
 Alembic setup; generating the first pass of the test suite (including the
-concurrency test); writing the Dockerfile, `docker-compose`, `render.yaml`, and
-the CI workflow; and drafting this README. I treated AI as a fast pair, not an
-oracle — every piece was run and verified against a real Postgres before being
-accepted.
+concurrency test); implementing the hardening layer I directed (JWT auth + RBAC,
+Idempotency-Key handling, slowapi rate limiting, paginated reads); writing the
+Dockerfile, `docker-compose`, `render.yaml`, and the CI workflow; and drafting
+this README. I treated AI as a fast pair, not an oracle — every piece was run and
+verified against a real Postgres before being accepted.
 
 **2. One example where AI improved the work.** Prompted with *"how do I guarantee
 no double-booking across multiple workers without pre-generating slot rows?"*, AI
@@ -360,3 +476,10 @@ tests against real Postgres (not SQLite) and building the test schema from the
 migrations** — because the whole correctness story depends on a Postgres-specific
 partial index and `IntegrityError` behaviour that SQLite can't reproduce; testing
 on SQLite would have been testing a fiction.
+
+**On scope: the hardening was my call, not the AI's.** Going beyond the brief to
+add RBAC, idempotent writes, rate limiting and pagination was a deliberate
+product/engineering decision I made and then directed the AI to implement to my
+spec — e.g. idempotency scoped per-user with a key-reuse guard, and rate limits
+keyed by forwarded client IP. The AI wrote the code; the decision about what the
+service needed to be production-ready was mine.

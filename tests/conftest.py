@@ -1,9 +1,11 @@
 """Pytest fixtures.
 
 Schema is built by running the real Alembic migrations against the test
-database at session start, so every test run also verifies that migrations
-apply cleanly (and that the partial unique index is created). Tables are
-truncated between tests for isolation.
+database at session start, so every run also verifies migrations apply cleanly.
+Tables are truncated between tests for isolation.
+
+Rate limiting is disabled for the main suite (so repeated test requests don't
+trip limits); it is tested in isolation in test_rate_limit.py.
 """
 from __future__ import annotations
 
@@ -20,6 +22,8 @@ os.environ.setdefault(
 )
 os.environ.setdefault("CLINIC_TIMEZONE", "Africa/Nairobi")
 os.environ.setdefault("MIN_LEAD_MINUTES", "60")
+os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes-long-000")
+os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
 
 import pytest  # noqa: E402
 from alembic import command  # noqa: E402
@@ -30,10 +34,11 @@ from sqlmodel import Session  # noqa: E402
 
 from app.db import engine  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Doctor, Patient, WorkingHours  # noqa: E402
+from app.models import Doctor, Patient, User, UserRole, WorkingHours  # noqa: E402
+from app.security import create_access_token, hash_password  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_TABLES = ["appointments", "working_hours", "patients", "doctors"]
+_TABLES = ["idempotency_keys", "appointments", "working_hours", "users", "patients", "doctors"]
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -62,29 +67,14 @@ def session():
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
-
-
-@pytest.fixture
 def doctor(session) -> Doctor:
     """A doctor working Mon-Fri, 09:00-13:00 and 14:00-17:00 (lunch break)."""
     doc = Doctor(name="Dr. Test", specialty="General")
     session.add(doc)
     session.flush()
-    for dow in range(0, 5):  # Mon..Fri
-        session.add(
-            WorkingHours(
-                doctor_id=doc.id, day_of_week=dow,
-                start_time=time(9, 0), end_time=time(13, 0),
-            )
-        )
-        session.add(
-            WorkingHours(
-                doctor_id=doc.id, day_of_week=dow,
-                start_time=time(14, 0), end_time=time(17, 0),
-            )
-        )
+    for dow in range(0, 5):
+        session.add(WorkingHours(doctor_id=doc.id, day_of_week=dow, start_time=time(9, 0), end_time=time(13, 0)))
+        session.add(WorkingHours(doctor_id=doc.id, day_of_week=dow, start_time=time(14, 0), end_time=time(17, 0)))
     session.commit()
     session.refresh(doc)
     return doc
@@ -97,3 +87,51 @@ def patient(session) -> Patient:
     session.commit()
     session.refresh(p)
     return p
+
+
+@pytest.fixture
+def patient_user(session, patient) -> User:
+    u = User(
+        email="p@example.com",
+        hashed_password=hash_password("patientpass123"),
+        role=UserRole.patient,
+        patient_id=patient.id,
+    )
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    return u
+
+
+@pytest.fixture
+def staff_user(session) -> User:
+    u = User(
+        email="staff@clinic.test",
+        hashed_password=hash_password("staffpass123"),
+        role=UserRole.staff,
+    )
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    return u
+
+
+def _auth_headers(user: User) -> dict[str, str]:
+    return {"Authorization": f"Bearer {create_access_token(user.id, user.role.value)}"}
+
+
+@pytest.fixture
+def anon_client() -> TestClient:
+    return TestClient(app)
+
+
+@pytest.fixture
+def client(staff_user) -> TestClient:
+    """Authenticated as clinical staff (can act across all patients)."""
+    return TestClient(app, headers=_auth_headers(staff_user))
+
+
+@pytest.fixture
+def patient_client(patient_user) -> TestClient:
+    """Authenticated as the seeded patient (can act only on their own data)."""
+    return TestClient(app, headers=_auth_headers(patient_user))

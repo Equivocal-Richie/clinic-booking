@@ -26,6 +26,13 @@ class CancelRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500, examples=["Patient unwell"])
 
 
+class PaginatedAppointments(BaseModel):
+    items: list["AppointmentRead"]
+    limit: int
+    offset: int
+    has_more: bool
+
+
 class AppointmentRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -44,3 +51,7 @@ class AppointmentRead(BaseModel):
         if start.tzinfo is None:
             start = start.replace(tzinfo=timezone.utc)
         return start + timedelta(minutes=self.duration_minutes)
+
+
+# Resolve the forward reference in PaginatedAppointments now AppointmentRead exists.
+PaginatedAppointments.model_rebuild()

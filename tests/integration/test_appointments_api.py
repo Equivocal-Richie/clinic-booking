@@ -104,7 +104,7 @@ def test_reschedule_to_taken_slot_returns_409_and_keeps_original(client, doctor,
     )
     assert r.status_code == 409
     # Original appointment unchanged (still at slot_a).
-    detail = client.get(f"/patients/{patient.id}/appointments").json()
+    detail = client.get(f"/patients/{patient.id}/appointments").json()["items"]
     a_start = next(a["start_time"] for a in detail if a["id"] == appt_a)
     assert datetime.fromisoformat(a_start) == slot_a.astimezone(timezone.utc)
 
@@ -131,7 +131,8 @@ def test_patient_appointments_sorted_and_excludes_cancelled(client, doctor, pati
 
     r = client.get(f"/patients/{patient.id}/appointments")
     assert r.status_code == 200
-    starts = [datetime.fromisoformat(a["start_time"]) for a in r.json()]
+    items = r.json()["items"]
+    starts = [datetime.fromisoformat(a["start_time"]) for a in items]
     assert starts == sorted(starts)  # ascending
     assert len(starts) == 2  # cancelled one excluded
     assert starts[0] == earlier.astimezone(timezone.utc)

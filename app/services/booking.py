@@ -148,9 +148,17 @@ def reschedule_appointment(
 
 
 def upcoming_for_patient(
-    session: Session, patient_id: int, now: datetime
-) -> list[Appointment]:
-    """Bonus endpoint: a patient's upcoming booked appointments, soonest first."""
+    session: Session,
+    patient_id: int,
+    now: datetime,
+    limit: int,
+    offset: int,
+) -> tuple[list[Appointment], bool]:
+    """A patient's upcoming booked appointments, soonest first, paginated.
+
+    Uses an indexed ORDER BY start_at with LIMIT/OFFSET and the "fetch one extra"
+    trick to report has_more without a COUNT(*). Returns (items, has_more).
+    """
     _require_patient(session, patient_id)
     rows = session.exec(
         select(Appointment)
@@ -160,9 +168,13 @@ def upcoming_for_patient(
             Appointment.start_at >= now,
         )
         .order_by(Appointment.start_at)
+        .offset(offset)
+        .limit(limit + 1)
     ).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     # Normalise tzinfo for any driver that returns naive UTC.
     for r in rows:
         if r.start_at.tzinfo is None:
             r.start_at = r.start_at.replace(tzinfo=timezone.utc)
-    return list(rows)
+    return list(rows), has_more

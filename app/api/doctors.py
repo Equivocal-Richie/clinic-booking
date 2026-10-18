@@ -8,10 +8,12 @@ from sqlmodel import Session
 
 from ..config import get_settings
 from ..db import get_session
+from ..models import User
 from ..schemas.availability import AvailabilityResponse, Slot
 from ..schemas.error import ErrorResponse
 from ..services import availability
 from ..services.timeutils import utcnow
+from .deps import get_current_user
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
 
@@ -19,7 +21,7 @@ router = APIRouter(prefix="/doctors", tags=["doctors"])
 @router.get(
     "/{doctor_id}/availability",
     response_model=AvailabilityResponse,
-    responses={404: {"model": ErrorResponse}},
+    responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
     summary="List available 30-minute slots for a doctor on a date",
 )
 def get_availability(
@@ -28,6 +30,7 @@ def get_availability(
         ..., description="Day to check, YYYY-MM-DD (clinic timezone)"
     ),
     session: Session = Depends(get_session),
+    _current: User = Depends(get_current_user),
 ) -> AvailabilityResponse:
     settings = get_settings()
     starts = availability.compute_availability(

@@ -25,6 +25,25 @@ class Settings(BaseSettings):
     # 0 disables the rule.
     min_lead_minutes: int = 60
 
+    # --- Auth (JWT) ---
+    # MUST be overridden in production via the SECRET_KEY env var.
+    secret_key: str = "dev-insecure-change-me"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60 * 12  # 12 hours
+
+    # --- Rate limiting ---
+    # Default global limit per client, plus a tighter limit on booking writes.
+    rate_limit_default: str = "120/minute"
+    rate_limit_booking: str = "15/minute"
+    rate_limit_enabled: bool = True
+    # Optional shared store for limits across workers/instances, e.g.
+    # redis://host:6379. In-memory (per-worker) when unset.
+    rate_limit_storage_uri: str = "memory://"
+
+    # --- Pagination ---
+    default_page_size: int = 20
+    max_page_size: int = 100
+
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.clinic_timezone)
