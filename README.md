@@ -12,9 +12,9 @@ Hardened with **JWT auth and patient/staff role-based access control**,
 reads** — see [Authentication & roles](#authentication--roles) and
 [Hardening features](#hardening-features).
 
-- **Live API:** `https://<your-service>.onrender.com`  _(replace after first deploy)_
-- **Interactive docs (Swagger):** `https://<your-service>.onrender.com/docs`
-- **Health check:** `https://<your-service>.onrender.com/health`
+- **Live API:** `https://clinic-booking-api-v0cj.onrender.com`
+- **Interactive docs (Swagger):** `https://clinic-booking-api-v0cj.onrender.com/docs`
+- **Health check:** `https://clinic-booking-api-v0cj.onrender.com/health`
 
 > First request after idle may take ~30–60s — Render's free tier spins the
 > service down when idle and wakes it on the next request.
