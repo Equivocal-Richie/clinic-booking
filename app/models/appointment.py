@@ -62,6 +62,13 @@ class Appointment(SQLModel, table=True):
     )
     cancellation_reason: str | None = Field(default=None)
 
+    # Set when a reminder email has been queued, so the beat scan never
+    # reminds the same appointment twice.
+    reminder_sent_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(DateTime(timezone=True), nullable=False),

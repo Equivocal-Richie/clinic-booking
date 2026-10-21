@@ -23,7 +23,9 @@ RUN chmod +x entrypoint.sh
 ENV PORT=8000
 EXPOSE 8000
 
-# Runs DB migrations, then starts gunicorn with multiple uvicorn workers.
-# Multiple workers is deliberate: it is exactly why slot exclusivity must be
-# enforced in the database, not in process memory.
-ENTRYPOINT ["./entrypoint.sh"]
+# Default command runs DB migrations then gunicorn (the web service).
+# Using CMD (not ENTRYPOINT) lets the Celery worker service reuse this same
+# image and override the command with `celery ... worker -B`.
+# Multiple gunicorn workers is deliberate: it is exactly why slot exclusivity
+# must be enforced in the database, not in process memory.
+CMD ["./entrypoint.sh"]

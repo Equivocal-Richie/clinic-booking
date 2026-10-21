@@ -7,10 +7,11 @@ is never double-booked, even under concurrent requests.
 Built with **FastAPI + SQLModel + PostgreSQL**, deployed on **Render** with a
 **GitHub Actions** pipeline that tests every PR and deploys on merge.
 
-Hardened with **JWT auth and patient/staff role-based access control**,
-**idempotent booking** (Idempotency-Key), **rate limiting**, and **paginated
-reads** — see [Authentication & roles](#authentication--roles) and
-[Hardening features](#hardening-features).
+Hardened with **JWT auth + refresh tokens and patient/staff role-based access
+control**, **idempotent booking** (Idempotency-Key), **rate limiting**,
+**paginated reads**, and **asynchronous email notifications** (Celery + Redis,
+with appointment reminders) — see [Authentication & roles](#authentication--roles),
+[Hardening features](#hardening-features), and [Notifications](#notifications-async).
 
 - **Live API:** `https://clinic-booking-api-v0cj.onrender.com`
 - **Interactive docs (Swagger):** `https://clinic-booking-api-v0cj.onrender.com/docs`
@@ -54,7 +55,8 @@ reads** — see [Authentication & roles](#authentication--roles) and
 | **Models** (`app/models/`) | SQLModel tables + the partial unique index that guarantees slot exclusivity. |
 | **Auth** (`app/security.py`, `app/api/deps.py`, `app/api/auth.py`) | JWT issuing/verification, bcrypt password hashing, and role guards (patient vs. staff). |
 | **Cross-cutting** (`app/ratelimit.py`, `app/errors.py`) | Rate limiting and a single consistent error envelope for every failure. |
-| **Migrations** (`alembic/`) | Versioned schema (three revisions): core tables + partial unique index; then users + idempotency keys; then refresh tokens. |
+| **Notifications** (`app/notifications/`, `app/tasks.py`, `app/celery_app.py`) | Async email on book/cancel/reschedule + reminders, via Celery tasks on a Redis broker. |
+| **Migrations** (`alembic/`) | Versioned schema (four revisions): core tables + partial unique index; users + idempotency keys; refresh tokens; appointment `reminder_sent_at`. |
 | **Config** (`app/config.py`) | 12-factor settings from env vars (DB URL, timezone, slot length, lead time, JWT secret, rate limits, page sizes). |
 
 ### Data model
@@ -118,6 +120,7 @@ erDiagram
       int duration_minutes
       enum status "booked|cancelled|completed"
       string cancellation_reason
+      datetime reminder_sent_at "null until reminded"
       datetime created_at
       datetime updated_at
     }
@@ -225,12 +228,45 @@ seeded or created by existing staff via `POST /auth/staff`.
 | **Idempotent booking** | `Idempotency-Key` header + `(user_id, key)` unique row | Safe client retries without duplicate bookings |
 | **Rate limiting** | slowapi: global `120/min` + `15/min` on booking, keyed by client IP (X-Forwarded-For aware) | Protect the service from spam/abuse |
 | **Pagination** | `limit`/`offset` with `has_more` (fetch limit+1, no COUNT) on list reads | Fast reads as data grows |
+| **Async notifications** | Celery tasks on a Redis broker; email on book/cancel/reschedule + reminders | Confirmations/reminders without slowing the request |
 | **Consistent errors** | one `{"error":{code,message}}` envelope for domain, auth, and validation failures | Predictable client handling |
 
 > Rate-limit note: the default limiter store is in-memory, i.e. **per worker**.
 > For a hard global limit across workers/instances, set `RATE_LIMIT_STORAGE_URI`
 > to a Redis URL — the same "shared guarantees need shared state" lesson as slot
 > locking.
+
+---
+
+## Notifications (async)
+
+Booking events send email **out of the request path** so the API stays fast and
+a slow/unavailable mail server never blocks a booking.
+
+- **Flow:** a successful `POST /appointments`, cancel, or reschedule enqueues a
+  Celery task (`app/tasks.py`) on a **Redis** broker; a **worker** process runs
+  it, loads the appointment/patient/doctor from the DB, builds the message
+  (`app/notifications/messages.py`, pure/testable), and sends it over **Gmail
+  SMTP** (`app/notifications/email.py`).
+- **Reminders:** Celery **beat** runs `scan_and_send_reminders` on a schedule;
+  it finds booked appointments starting within `REMINDER_LEAD_MINUTES` that
+  haven't been reminded, emails them, and stamps `reminder_sent_at` so none is
+  reminded twice.
+- **Serialization safety:** tasks carry only JSON-serializable primitives (ids,
+  ISO strings) and the Celery serializer is **JSON, never pickle** (pickle
+  deserialization is an RCE vector). Tasks reload rich data from the DB.
+- **Resilience:** enqueue is wrapped so a broker outage logs and is ignored —
+  the booking already succeeded; email is best-effort. Sending is **gated by
+  `NOTIFICATIONS_ENABLED`** (off by default, so dev/tests never send mail), and
+  `NOTIFY_OVERRIDE_EMAIL` can redirect all mail to one inbox for testing.
+
+**Config:** `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`, `NOTIFICATIONS_ENABLED`,
+`SMTP_HOST`/`SMTP_PORT`/`SMTP_USERNAME`/`SMTP_PASSWORD` (a Gmail **App
+Password**), `EMAIL_FROM`, `NOTIFY_OVERRIDE_EMAIL`, `REMINDER_LEAD_MINUTES`,
+`REMINDER_SCAN_INTERVAL_MINUTES`.
+
+Run the whole stack locally with `docker compose up --build` (adds `redis` and a
+`worker` running `celery -A app.celery_app worker -B`).
 
 ---
 
@@ -365,7 +401,7 @@ export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/clinic
 pytest --cov=app --cov-report=term-missing
 ```
 
-**60 tests, ~97% coverage.** Layers:
+**66 tests, ~97% coverage.** Layers:
 
 - **Unit** (`tests/unit/`) — the pure slot grid and timezone logic: boundaries,
   lunch gaps, off days, last-slot-must-fit, lead-time filtering. No DB, fast.
@@ -381,6 +417,10 @@ pytest --cov=app --cov-report=term-missing
 - **Tokens** (`test_auth_tokens.py`) — `/auth/me`; refresh issues a working
   access token and rotates the refresh token; a reused/rotated token is rejected
   (401); logout revokes.
+- **Notifications** (`test_notifications.py`) — Celery runs eagerly with SMTP
+  mocked: book/cancel/reschedule each enqueue the right email; the reminder scan
+  selects due appointments, dedupes, and skips far-off ones; SMTP is untouched
+  when disabled.
 - **Idempotency** (`test_idempotency.py`) — same key replays the original 201,
   different body is rejected, a failed attempt releases the key.
 - **Pagination** (`test_pagination.py`) and **rate limiting**
@@ -393,8 +433,8 @@ run also verifies migrations apply cleanly and create the partial unique index.
 
 ## Section 3 — Deployment & CI/CD
 
-**Platform:** Render (Dockerized web service + managed Postgres), defined as
-infrastructure-as-code in [`render.yaml`](./render.yaml).
+**Platform:** Render (Dockerized web service + managed Postgres + Redis + a
+Celery worker), defined as infrastructure-as-code in [`render.yaml`](./render.yaml).
 
 **Deploy trigger:** merges to **`main`**. Direct pushes to `main` should be
 blocked by branch protection so all changes arrive via reviewed, test-passing PRs.
@@ -415,6 +455,16 @@ One secret is required in the GitHub repo: `RENDER_DEPLOY_HOOK_URL` (from the
 Render service's *Settings → Deploy Hook*). The container's entrypoint runs
 `alembic upgrade head` on every boot before serving, so deploys are
 self-migrating.
+
+**Notification services:** `render.yaml` also declares a **Redis** (Key Value)
+instance and a **Celery worker** (`celery -A app.celery_app worker -B`, same
+image, command overridden). The Postgres and Redis free tiers suffice, but
+**Render worker services are a paid type** — so for a free deployment, keep
+`NOTIFICATIONS_ENABLED=false` on the web service and run the worker locally
+(`docker compose up`) or on another host, or add the paid worker to turn
+notifications on. The SMTP credentials are set as **unsynced env vars**
+(`sync: false`) so the Gmail App Password is entered in the dashboard, never
+committed.
 
 > **Alternative considered:** let Render auto-deploy on push to `main` and rely
 > on branch protection to ensure tests passed first. Simpler (less YAML) but it
@@ -442,6 +492,10 @@ The brief invited judgement calls; here are the notable ones.
   applied identically to availability and booking so they never disagree.
 - **Slot length is stored per-appointment** (`duration_minutes`) even though it's
   fixed at 30 today — cheap insurance for "we want to grow".
+- **Notifications use Celery + Redis** (durable queue, retries, scales), chosen
+  over in-process `BackgroundTasks`; the trade-off is a Redis broker and a worker
+  process to operate. The serializer is JSON (never pickle) for safety, and
+  sending is gated off by default so nothing emails real patients by accident.
 
 ---
 
@@ -457,7 +511,10 @@ Auth/RBAC, idempotent booking, rate limiting, and pagination are **implemented**
 - **Keyset (cursor) pagination** for very large lists (offset degrades deep in).
 - **Doctor time-off / holidays** as a first-class concept (today, only recurring
   weekly hours exist).
-- **Notifications** (email/SMS reminders) — a natural clinic feature.
+- **SMS / push notifications** (email is implemented; SMS/push would reuse the
+  same Celery task layer).
+- **Dedicated Celery beat service** (today beat is embedded in the worker via
+  `-B`; a separate beat avoids duplicate schedules when scaling workers).
 - **Patient-level overlap prevention** across doctors (currently per-doctor only).
 
 ---

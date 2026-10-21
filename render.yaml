@@ -1,8 +1,12 @@
 # Render Blueprint (infrastructure as code).
-# Creates a Dockerized web service + a managed Postgres database.
-# autoDeploy is OFF on purpose: deploys are triggered by the GitHub Actions
-# pipeline only AFTER the test suite passes on a merge to main (see
-# .github/workflows/ci.yml). This keeps test -> gate -> deploy in one place.
+# Web service + managed Postgres + Redis (Key Value) + a Celery worker.
+# autoDeploy is OFF on the web service: deploys are triggered by the GitHub
+# Actions pipeline after tests pass (see .github/workflows/ci.yml).
+#
+# COST NOTE: the Postgres and Redis free tiers are fine, but Render *worker*
+# services are a paid type (no free plan). If you want to stay free, run the
+# Celery worker locally (docker compose) or on another host, and keep
+# NOTIFICATIONS_ENABLED=false on the web service. Everything else deploys free.
 databases:
   - name: clinic-db
     plan: free
@@ -10,6 +14,12 @@ databases:
     user: clinic
 
 services:
+  - type: redis
+    name: clinic-redis
+    plan: free
+    ipAllowList: []          # internal-only (broker/result backend)
+    maxmemoryPolicy: noeviction
+
   - type: web
     name: clinic-booking-api
     runtime: docker
@@ -21,6 +31,16 @@ services:
         fromDatabase:
           name: clinic-db
           property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: clinic-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: clinic-redis
+          property: connectionString
       - key: CLINIC_TIMEZONE
         value: Africa/Nairobi
       - key: MIN_LEAD_MINUTES
@@ -29,9 +49,50 @@ services:
         value: "2"
       - key: SEED_ON_START
         value: "true"
-      # JWT signing secret — generated once by Render and kept stable.
       - key: SECRET_KEY
         generateValue: true
-      # Optional: set to a Redis URL for cross-worker rate limiting.
-      # - key: RATE_LIMIT_STORAGE_URI
-      #   value: redis://...
+      # Notifications: enable + fill these (Gmail App Password) to send mail.
+      - key: NOTIFICATIONS_ENABLED
+        value: "false"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: NOTIFY_OVERRIDE_EMAIL
+        sync: false
+
+  - type: worker
+    name: clinic-booking-worker
+    runtime: docker
+    plan: starter            # paid: worker services have no free plan
+    autoDeploy: false
+    dockerCommand: celery -A app.celery_app worker -B --loglevel=info
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: clinic-db
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: clinic-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: clinic-redis
+          property: connectionString
+      - key: CLINIC_TIMEZONE
+        value: Africa/Nairobi
+      - key: NOTIFICATIONS_ENABLED
+        value: "true"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: NOTIFY_OVERRIDE_EMAIL
+        sync: false

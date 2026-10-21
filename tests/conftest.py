@@ -32,10 +32,15 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 from sqlmodel import Session  # noqa: E402
 
+from app.celery_app import celery_app  # noqa: E402
 from app.db import engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Doctor, Patient, User, UserRole, WorkingHours  # noqa: E402
 from app.security import create_access_token, hash_password  # noqa: E402
+
+# Run Celery tasks synchronously in-process during tests (no broker needed).
+celery_app.conf.task_always_eager = True
+celery_app.conf.task_eager_propagates = True
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TABLES = ["idempotency_keys", "refresh_tokens", "appointments", "working_hours", "users", "patients", "doctors"]

@@ -46,6 +46,29 @@ class Settings(BaseSettings):
     default_page_size: int = 20
     max_page_size: int = 100
 
+    # --- Celery / Redis (async notifications) ---
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/1"
+
+    # --- Email notifications (Gmail SMTP) ---
+    # Off by default so no mail is sent in dev/tests unless explicitly enabled.
+    notifications_enabled: bool = False
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_username: str = ""
+    # A Gmail *App Password* (16 chars), not the account password.
+    smtp_password: str = ""
+    email_from: str = "Clinic Booking <no-reply@clinic.example>"
+    # If set, every notification goes here instead of the patient's address
+    # (handy for testing a live SMTP setup without emailing real patients).
+    notify_override_email: str | None = None
+
+    # --- Reminders ---
+    # Send a reminder when an appointment starts within this many minutes.
+    reminder_lead_minutes: int = 24 * 60  # 24 hours
+    # How often the beat scheduler scans for due reminders.
+    reminder_scan_interval_minutes: int = 15
+
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.clinic_timezone)

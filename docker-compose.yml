@@ -1,4 +1,5 @@
-# Local development: API + Postgres. Run: docker compose up --build
+# Local development: API + Postgres + Redis + Celery worker (with embedded beat).
+# Run: docker compose up --build
 services:
   db:
     image: postgres:16
@@ -14,15 +15,49 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
   api:
     build: .
-    environment:
+    environment: &app_env
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/clinic
       CLINIC_TIMEZONE: Africa/Nairobi
       MIN_LEAD_MINUTES: "60"
       SEED_ON_START: "true"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      # Flip to "true" and fill the SMTP_* vars to actually send mail.
+      NOTIFICATIONS_ENABLED: "false"
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: "587"
+      SMTP_USERNAME: ""
+      SMTP_PASSWORD: ""
+      EMAIL_FROM: "Clinic Booking <no-reply@clinic.example>"
+      NOTIFY_OVERRIDE_EMAIL: ""
     ports:
       - "8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    # Celery worker with embedded beat (-B) so one process handles both
+    # task execution and the periodic reminder scan.
+    command: celery -A app.celery_app worker -B --loglevel=info
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
         condition: service_healthy

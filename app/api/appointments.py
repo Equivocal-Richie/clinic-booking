@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timezone
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sqlmodel import Session
@@ -15,6 +17,7 @@ from ..schemas.appointment import (
     RescheduleRequest,
 )
 from ..schemas.error import ErrorResponse
+from ..notifications import dispatch
 from ..services import booking, idempotency
 from ..services.timeutils import to_utc, utcnow
 from .deps import ensure_can_act_on_patient, get_current_user
@@ -101,6 +104,7 @@ def create_appointment(
     body = AppointmentRead.model_validate(appt).model_dump(mode="json")
     if idempotency_key:
         idempotency.complete(session, current.id, idempotency_key, 201, body)
+    dispatch.on_booking_created(appt.id)
     return JSONResponse(status_code=201, content=body)
 
 
@@ -123,6 +127,7 @@ def cancel_appointment(
     appt = booking.cancel_appointment(
         session, appointment_id, reason=payload.reason, now=utcnow()
     )
+    dispatch.on_cancelled(appt.id)
     return AppointmentRead.model_validate(appt)
 
 
@@ -142,8 +147,12 @@ def reschedule_appointment(
     if appt is None:
         raise HTTPException(status_code=404, detail="Appointment not found")
     ensure_can_act_on_patient(current, appt.patient_id)
+    old_start = appt.start_at  # capture before the service moves it
+    if old_start.tzinfo is None:
+        old_start = old_start.replace(tzinfo=timezone.utc)
     new_start_utc = to_utc(payload.start_time, _settings.tz)
     appt = booking.reschedule_appointment(
         session, appointment_id, new_start_at_utc=new_start_utc, now=utcnow()
     )
+    dispatch.on_rescheduled(appt.id, old_start.isoformat())
     return AppointmentRead.model_validate(appt)
