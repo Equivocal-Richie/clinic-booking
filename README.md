@@ -521,51 +521,55 @@ Auth/RBAC, idempotent booking, rate limiting, and pagination are **implemented**
 
 ## Section 4 — AI reflection
 
-> The brief says AI use is expected and that honesty matters more than the answer.
-> This reflects how the project was actually built. _(Richard: please read and
-> adjust to your own voice/experience before submitting.)_
+The brief says AI use is expected and that honesty matters more than the answer,
+so here is how I actually built this.
 
-**1. What AI was used for across the four sections.** Scaffolding the project
-layout; drafting the SQLModel models, the pure/impure service split, and the
-Alembic setup; generating the first pass of the test suite (including the
-concurrency test); implementing the hardening layer I directed (JWT auth + RBAC,
-Idempotency-Key handling, slowapi rate limiting, paginated reads); writing the
-Dockerfile, `docker-compose`, `render.yaml`, and the CI workflow; and drafting
-this README. I treated AI as a fast pair, not an oracle — every piece was run and
-verified against a real Postgres before being accepted.
+**1. What I used AI for across the four sections.**
+I leaned on AI (Claude) a lot here, basically as a fast pair programmer, while I
+kept hold of the design and the decisions. It helped me write up the system
+design and data model, scaffold the project, and produce the models, service
+layer, endpoints and tests. It also wrote the Dockerfile, docker-compose,
+render.yaml and the GitHub Actions pipeline, and later the extra hardening I
+decided to add (JWT auth and refresh tokens, RBAC, idempotent booking, rate
+limiting, pagination, and the Celery/Redis notifications). I worked by telling it
+what I wanted in plain language, reading every change, and running it against a
+real Postgres before I accepted anything. I treated it as fast hands rather than
+something to trust blindly.
 
-**2. One example where AI improved the work.** Prompted with *"how do I guarantee
-no double-booking across multiple workers without pre-generating slot rows?"*, AI
-proposed a **partial unique index** (`... WHERE status = 'booked'`) rather than
-application locks. That single idea shaped the whole design: it makes the
-guarantee race-proof at the database, lets cancellations free a slot without
-deleting rows, and makes reschedule a one-row update. It also flagged the
-`postgres://` → `postgresql+psycopg://` driver gotcha that would otherwise have
-broken the Render deploy.
+**2. One example where AI improved my work.**
+I asked how to stop two patients booking the same slot across multiple workers
+without pre-generating a row for every slot. Instead of reaching for locks in the
+app, it suggested a partial unique index (UNIQUE on `doctor_id, start_at` WHERE
+`status = 'booked'`) and letting the database reject whoever loses the race, which
+the API turns into a 409. That one idea shaped the whole design. Availability ends
+up being calculated on the fly instead of stored, cancelling a slot frees it again
+without deleting any history, and rescheduling becomes a single row update. It
+also caught something that would have broken the deploy: Render gives you a
+`postgres://` URL, but SQLAlchemy needs it as `postgresql+psycopg://`.
 
 **3. One example where AI output was wrong or incomplete, and how I caught it.**
-While wiring the app, route introspection showed `include_router` apparently
-adding *zero* routes, and the first instinct (mine and the tool's) was a Starlette
-version bug — a Starlette pin was even applied. Running the app against a real
-`TestClient` showed all six endpoints responding fine: the "missing routes" were
-an artifact of this FastAPI version keeping included routers as a sub-router
-object rather than flattening them. Lesson: trust an end-to-end check over
-introspection. (Separately, a genuinely incompatible Starlette 1.x *was* caught
-and pinned — but only functional testing distinguished the real problem from the
-false alarm.)
+Partway through, a route check showed `include_router` apparently adding no routes,
+and the AI decided it was a Starlette version bug and even pinned a downgrade. That
+didn't feel right to me, so instead of trusting the check I had it actually run the
+app with a `TestClient`. Every endpoint was there and working. The "missing routes"
+were just how this version of FastAPI stores included routers, and the real issue
+turned out to be a different Starlette incompatibility that only showed up when the
+thing was running. After that I made a rule for the rest of the build: trust a
+running service and a real database over introspection or the AI sounding
+confident. That is also why I insisted the tests run on real Postgres and not
+SQLite, since the whole double-booking guarantee relies on Postgres behaviour
+SQLite can't copy.
 
-**4. Two decisions made without AI, and why I trusted my own judgment.**
-(a) **Deriving availability instead of storing slot rows** — a data-modelling
-call grounded in knowing how pre-materialised schedules rot as hours change and
-data grows; I wanted the schema to stay small as the clinic scales. (b) **Running
-tests against real Postgres (not SQLite) and building the test schema from the
-migrations** — because the whole correctness story depends on a Postgres-specific
-partial index and `IntegrityError` behaviour that SQLite can't reproduce; testing
-on SQLite would have been testing a fiction.
+**4. Two decisions I made without the AI, or against it.**
+First, using Celery and Redis for the notifications. The AI actually recommended
+the simpler in-process BackgroundTasks because it fits Render's free tier better.
+I went with a Redis broker and a Celery worker anyway, because I wanted the
+durable, retryable setup you would really run in production, and I was fine taking
+on the extra infrastructure and cost for it.
 
-**On scope: the hardening was my call, not the AI's.** Going beyond the brief to
-add RBAC, idempotent writes, rate limiting and pagination was a deliberate
-product/engineering decision I made and then directed the AI to implement to my
-spec — e.g. idempotency scoped per-user with a key-reuse guard, and rate limits
-keyed by forwarded client IP. The AI wrote the code; the decision about what the
-service needed to be production-ready was mine.
+Second, taking the work well past what the brief asked for. The assignment only
+needed four endpoints. I decided it should look more like something you would
+actually ship, with access control over what is basically health data, safe
+retries, some protection against abuse, and proper notifications. The AI would
+have happily stopped at the requirements. Deciding what "finished" really meant
+was on me.
