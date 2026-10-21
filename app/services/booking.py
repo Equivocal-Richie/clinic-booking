@@ -31,10 +31,20 @@ def _require_patient(session: Session, patient_id: int) -> Patient:
     return patient
 
 
-def _require_appointment(session: Session, appointment_id: int) -> Appointment:
+def _lock_appointment(session: Session, appointment_id: int) -> Appointment:
+    """Load an appointment and take a row lock (SELECT ... FOR UPDATE) on it.
+
+    Cancel and reschedule both mutate a single appointment, so they must not
+    interleave: without the lock, a concurrent cancel + reschedule can leave the
+    row cancelled *and* moved (the reschedule's UPDATE lands on a row the cancel
+    just closed). Locking + refreshing serializes the two and makes each see the
+    other's committed state, so the second operation correctly rejects.
+    """
     appt = session.get(Appointment, appointment_id)
     if appt is None:
         raise NotFoundError(f"Appointment {appointment_id} does not exist")
+    # Lock the row and refresh its state from the locked read.
+    session.refresh(appt, with_for_update=True)
     return appt
 
 
@@ -109,7 +119,7 @@ def create_appointment(
 def cancel_appointment(
     session: Session, appointment_id: int, reason: str, now: datetime
 ) -> Appointment:
-    appt = _require_appointment(session, appointment_id)
+    appt = _lock_appointment(session, appointment_id)
     if appt.status == AppointmentStatus.cancelled:
         raise ConflictStateError("Appointment is already cancelled")
 
@@ -125,7 +135,7 @@ def cancel_appointment(
 def reschedule_appointment(
     session: Session, appointment_id: int, new_start_at_utc: datetime, now: datetime
 ) -> Appointment:
-    appt = _require_appointment(session, appointment_id)
+    appt = _lock_appointment(session, appointment_id)
     if appt.status == AppointmentStatus.cancelled:
         raise ConflictStateError("Cannot reschedule a cancelled appointment")
 

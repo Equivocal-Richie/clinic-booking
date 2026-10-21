@@ -163,14 +163,21 @@ CREATE UNIQUE INDEX uq_active_appointment_slot
 - **Reschedule** is just `UPDATE appointments SET start_at = :new WHERE id = :id`
   on the same row: the original slot frees atomically and the same index rejects
   the move if the destination is taken.
+- **Cancel and reschedule take a row lock** (`SELECT ... FOR UPDATE` on the
+  appointment) before mutating it. The partial unique index protects the *slot*,
+  but a cancel racing a reschedule on the *same appointment* could otherwise lose
+  an update (leave it cancelled yet moved). Locking serializes the two so the
+  second sees the first's committed state and rejects cleanly.
 
 **Why not application-level checks or locks?** A check-then-insert in app code
 has a time-of-check/time-of-use race. In-process locks (`threading.Lock`,
 `asyncio.Lock`) are *useless here* because the app is deployed with multiple
 gunicorn workers (and can scale to multiple instances) — a lock in one process
 says nothing to another. The database is the only shared, authoritative arbiter,
-so that is where the guarantee belongs. (`SELECT ... FOR UPDATE` and SERIALIZABLE
-isolation would also work but add contention/complexity for no benefit here.)
+so that is where the guarantee belongs. For the *booking insert* specifically,
+`SELECT ... FOR UPDATE` or SERIALIZABLE isolation would also work but add
+contention for no benefit, since the unique index already decides the race.
+(Row locking does earn its place for cancel/reschedule edits, as noted below.)
 
 ### Key decision 3 — Store UTC, reason in clinic-local time
 
@@ -401,7 +408,7 @@ export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/clinic
 pytest --cov=app --cov-report=term-missing
 ```
 
-**66 tests, ~97% coverage.** Layers:
+**67 tests, ~97% coverage.** Layers:
 
 - **Unit** (`tests/unit/`) — the pure slot grid and timezone logic: boundaries,
   lunch gaps, off days, last-slot-must-fit, lead-time filtering. No DB, fast.
@@ -410,8 +417,9 @@ pytest --cov=app --cov-report=term-missing
   cancel/reschedule lifecycle, and the bonus patient list.
 - **Concurrency** (`tests/integration/test_concurrency.py`) — fires 20 real
   concurrent booking attempts at the same slot (each on its own connection) and
-  asserts **exactly one succeeds** and the database ends with exactly one active
-  row. This is the proof that the slot guarantee holds under load.
+  asserts **exactly one succeeds** with exactly one active row left; and 20
+  concurrent cancels of one appointment, asserting exactly one succeeds and the
+  rest get a clean conflict. This is the proof the guarantees hold under load.
 - **Auth & RBAC** (`test_auth_rbac.py`) — register/login, 401 without a token,
   and patients blocked (403) from acting on other patients or staff routes.
 - **Tokens** (`test_auth_tokens.py`) — `/auth/me`; refresh issues a working

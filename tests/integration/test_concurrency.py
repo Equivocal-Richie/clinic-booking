@@ -17,7 +17,7 @@ from sqlmodel import Session, select
 from app.db import engine
 from app.models import Appointment, AppointmentStatus
 from app.services import booking
-from app.services.exceptions import SlotTakenError
+from app.services.exceptions import ConflictStateError, SlotTakenError
 
 from .. import support
 
@@ -54,3 +54,27 @@ def test_concurrent_bookings_only_one_succeeds(doctor, patient):
             )
         ).all()
     assert len(rows) == 1
+
+
+def test_concurrent_cancels_only_one_succeeds(session, doctor, patient):
+    """Cancel and reschedule take a row lock (SELECT ... FOR UPDATE), so racing
+    cancels of one appointment serialize: exactly one succeeds and the rest get a
+    clean 'already cancelled' conflict — no lost updates, no duplicate work."""
+    slot = support.utc_slot(10, 0, weekday=0)
+    now = slot - timedelta(days=1)
+    appt = booking.create_appointment(session, doctor.id, patient.id, slot, now)
+    appt_id = appt.id
+
+    def attempt(_: int) -> str:
+        with Session(engine) as s:
+            try:
+                booking.cancel_appointment(s, appt_id, "race", now)
+                return "ok"
+            except ConflictStateError:
+                return "already"
+
+    with ThreadPoolExecutor(max_workers=N) as pool:
+        results = list(pool.map(attempt, range(N)))
+
+    assert results.count("ok") == 1, results
+    assert results.count("already") == N - 1
