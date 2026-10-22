@@ -198,6 +198,28 @@ the slot-exclusivity pattern — so even two simultaneous retries resolve to one
 booking. A key reused with a *different* body is rejected (422); a key is
 released if the first attempt failed, so a corrected retry can reuse it.
 
+### Key decision 5 — Serialization and validation in one place
+
+Serialization, deserialization and validation are handled by **Pydantic as a
+single boundary layer**, not scattered as ad-hoc parsing. Incoming JSON is
+deserialized into typed request models that validate shape before any handler
+runs (returning 422), while business rules (past times, the lead window, working
+hours) are checked in the service layer (returning 400). Outgoing data is
+serialized from typed response models, so the API contract is defined by types
+rather than hand-built dicts. Timezone normalization to UTC happens right at the
+boundary (`services/timeutils.to_utc`), so stored and compared timestamps are
+never ambiguous.
+
+The same discipline extends beyond the request cycle: the idempotency store keeps
+responses as JSON, and Celery tasks serialize their payloads as **JSON, never
+pickle** (pickle deserialization is an RCE vector), carrying only ids and ISO
+strings and reloading rich data in the worker.
+
+We intentionally do **not** persist multi-step "booking wizard" state in a cache,
+because a booking here is a single stateless request, so there is no partial
+state to serialize between steps. If a multi-step or payment flow were added
+later, that state would live in Redis as JSON (again, not pickle).
+
 ---
 
 ## Authentication & roles
